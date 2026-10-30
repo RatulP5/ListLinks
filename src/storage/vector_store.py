@@ -3,7 +3,7 @@ from pathlib import Path
 import sqlite3
 from sentence_transformers import SentenceTransformer
 import sqlite_vec
-from text_splitter import TextSplitter
+from src.storage.text_splitter import TextSplitter
 
 
 class BookmarkStore:
@@ -15,7 +15,7 @@ class BookmarkStore:
     self.db.execute("PRAGMA journal_mode=WAL;")
     self.db.execute("PRAGMA foreign_keys=ON;")
 
-    # Load extension
+    # Enable and load sqlite-vec extension
     self.db.enable_load_extension(True)
     sqlite_vec.load(self.db)
     self.db.enable_load_extension(False)
@@ -28,11 +28,21 @@ class BookmarkStore:
   def _init_db(self):
     with self.db:
       self.db.execute("""
+                CREATE TABLE IF NOT EXISTS lists (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+      self.db.execute("""
                 CREATE TABLE IF NOT EXISTS articles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT UNIQUE NOT NULL,
+                    list_id INTEGER NOT NULL,
+                    url TEXT NOT NULL,
                     title TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(list_id) REFERENCES lists(id) ON DELETE CASCADE,
+                    UNIQUE(list_id, url)
                 );
             """)
       self.db.execute("""
@@ -43,26 +53,80 @@ class BookmarkStore:
                 );
             """)
 
-  def add_article(self, url: str, title: str, full_text: str) -> int:
-    """Inserts metadata once into 'articles', and chunks into 'chunks'."""
-    self.delete_by_url(url)  # Clean previous version if re-adding
+  # --- List Management ---
+
+  def get_or_create_list(self, list_name: str) -> int:
+    """Returns the ID of an existing list or creates a new one."""
+    clean_name = list_name.strip()
+    with self.db:
+      cur = self.db.execute(
+          "SELECT id FROM lists WHERE name = ?", (clean_name,)
+      )
+      row = cur.fetchone()
+      if row:
+        return row[0]
+
+      cur = self.db.execute(
+          "INSERT INTO lists (name) VALUES (?)", (clean_name,)
+      )
+      return cur.lastrowid
+
+  def get_all_lists(self) -> list[dict]:
+    """Returns all created lists with article counts."""
+    sql = """
+            SELECT l.id, l.name, COUNT(a.id) as article_count
+            FROM lists l
+            LEFT JOIN articles a ON l.id = a.list_id
+            GROUP BY l.id
+            ORDER BY l.name ASC;
+        """
+    cursor = self.db.execute(sql)
+    return [
+        {"id": row[0], "name": row[1], "article_count": row[2]}
+        for row in cursor.fetchall()
+    ]
+
+  # --- Ingestion ---
+
+  def add_article_to_list(
+      self, list_id: int, url: str, title: str, full_text: str
+  ) -> int:
+    """Chunks, embeds, and stores an article attached to a specific list."""
+    if not full_text or not full_text.strip():
+      return 0
 
     chunks = self.splitter.split_text(full_text)
     if not chunks:
       return 0
 
-    # 1. Encode all chunks in one fast vector batch
+    # 1. Vectorize all chunks at once
     vectors = self.embedder.encode(chunks, convert_to_numpy=True).tolist()
 
     with self.db:
-      # 2. Insert metadata ONCE
+      # 2. Check if this URL already exists in this list; if so, clear its old chunks
       cur = self.db.execute(
-          "INSERT INTO articles (url, title) VALUES (?, ?)",
-          (url, title or "Untitled"),
+          "SELECT id FROM articles WHERE list_id = ? AND url = ?",
+          (list_id, url),
       )
-      article_id = cur.lastrowid
+      existing = cur.fetchone()
 
-      # 3. Insert chunks paired with article_id
+      if existing:
+        article_id = existing[0]
+        self.db.execute(
+            "DELETE FROM chunks WHERE article_id = ?", (article_id,)
+        )
+        self.db.execute(
+            "UPDATE articles SET title = ? WHERE id = ?",
+            (title or "Untitled", article_id),
+        )
+      else:
+        cur = self.db.execute(
+            "INSERT INTO articles (list_id, url, title) VALUES (?, ?, ?)",
+            (list_id, url, title or "Untitled"),
+        )
+        article_id = cur.lastrowid
+
+      # 3. Store new chunks
       for chunk, vec in zip(chunks, vectors):
         self.db.execute(
             """
@@ -73,24 +137,60 @@ class BookmarkStore:
         )
 
     return len(chunks)
+  def get_articles_by_list(self, list_id: int) -> list[dict]:
+    """Fetches all saved URLs and titles belonging to a specific list."""
+    sql = """
+          SELECT id, url, title, created_at
+          FROM articles
+          WHERE list_id = ?
+          ORDER BY created_at DESC;
+        """
+    cursor = self.db.execute(sql, (list_id,))
+    return [
+          {
+              "id": row[0],
+              "url": row[1],
+              "title": row[2],
+              "created_at": row[3],
+          }
+          for row in cursor.fetchall()
+    ]
 
-  def search(self, query: str, top_k: int = 4) -> list[dict]:
-    """Finds nearest chunks and joins the article metadata."""
+  # --- Retrieval ---
+
+  def search(
+      self, query: str, list_id: int | None = None, top_k: int = 4
+  ) -> list[dict]:
+    """Searches chunks across all lists, or scoped strictly to a list_id."""
     query_vec = json.dumps(self.embedder.encode(query).tolist())
 
-    sql = """
-            SELECT 
-                a.url,
-                a.title,
-                c.content,
-                c.distance
-            FROM chunks c
-            JOIN articles a ON c.article_id = a.id
-            WHERE c.embedding MATCH ? and k = ?
-            ORDER BY c.distance;
-        """
+    if list_id is not None:
+      sql = """
+                SELECT 
+                    a.url,
+                    a.title,
+                    c.content,
+                    c.distance
+                FROM chunks c
+                JOIN articles a ON c.article_id = a.id
+                WHERE a.list_id = ? AND c.embedding MATCH ? AND k = ?
+                ORDER BY c.distance;
+            """
+      cursor = self.db.execute(sql, (list_id, query_vec, top_k))
+    else:
+      sql = """
+                SELECT 
+                    a.url,
+                    a.title,
+                    c.content,
+                    c.distance
+                FROM chunks c
+                JOIN articles a ON c.article_id = a.id
+                WHERE c.embedding MATCH ? AND k = ?
+                ORDER BY c.distance;
+            """
+      cursor = self.db.execute(sql, (query_vec, top_k))
 
-    cursor = self.db.execute(sql, (query_vec, top_k))
     return [
         {
             "url": row[0],
@@ -100,69 +200,3 @@ class BookmarkStore:
         }
         for row in cursor.fetchall()
     ]
-
-  def delete_by_url(self, url: str) -> int:
-    """Deletes the article and all its associated vector chunks."""
-    with self.db:
-      cur = self.db.execute("SELECT id FROM articles WHERE url = ?", (url,))
-      row = cur.fetchone()
-      if not row:
-        return 0
-
-      article_id = row[0]
-      # Clean chunks first, then article
-      self.db.execute("DELETE FROM chunks WHERE article_id = ?", (article_id,))
-      self.db.execute("DELETE FROM articles WHERE id = ?", (article_id,))
-      return 1
-
-  def get_all_embeddings(self) -> list[list[float]]:
-    """Fetches all chunk vectors for computing the user interest centroid."""
-    cursor = self.db.execute("SELECT embedding FROM chunks")
-    return [json.loads(row[0]) for row in cursor.fetchall()]
-
-  def get_stats(self) -> dict:
-    with self.db:
-      articles = self.db.execute("SELECT count(*) FROM articles").fetchone()[0]
-      chunks = self.db.execute("SELECT count(*) FROM chunks").fetchone()[0]
-    return {"unique_articles": articles, "total_chunks": chunks}
-
-if __name__ == "__main__":
-  store = BookmarkStore("./data/test_normalized.db")
-
-  url_a = "https://en.wikipedia.org/wiki/Convolutional_neural_network"
-  title_a = "Convolutional Neural Network"
-  text_a = (
-      "A convolutional neural network consists of an input layer, hidden"
-      " layers and an output layer. In any feed-forward neural network, any"
-      " middle layers are called hidden because their inputs and outputs are"
-      " masked by the activation function and final convolution. In a"
-      " convolutional neural network, the hidden layers include layers that"
-      " perform convolutions. Typically, this includes a layer that performs a"
-      " dot product of the convolution kernel with the layer's input matrix."
-      " Max pooling layers progressively reduce the spatial size of the"
-      " representation to reduce the amount of parameters and computation in the"
-      " network."
-  )
-
-  url_b = "https://en.wikipedia.org/wiki/B-tree"
-  title_b = "B-tree Data Structure"
-  text_b = (
-      "In computer science, a B-tree is a self-balancing tree data structure"
-      " that maintains sorted data and allows searches, sequential access,"
-      " insertions, and deletions in logarithmic time. The B-tree generalizes"
-      " the binary search tree, allowing for nodes with more than two children."
-      " Unlike other self-balancing binary search trees, the B-tree is"
-      " well-suited for storage systems that read and write relatively large"
-      " blocks of data, such as databases and file systems."
-  )
-
-  print("\n[*] Indexing articles into SQLite...")
-  store.add_article(url_a, title_a, text_a)
-  store.add_article(url_b, title_b, text_b)
-
-  print("Stats:", store.get_stats())
-  while True:
-    query=input("Enter query: ")
-    hits = store.search(query)
-    for h in hits:
-      print(f"[{h['title']}] ({h['similarity']}): {h['content']}")
