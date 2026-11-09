@@ -1,15 +1,24 @@
+from urllib.parse import urlparse
 from src.ingestion.html_fetcher import fetch_html
 from src.ingestion.image_extractor import extract_images
+from src.ingestion.pdf_extractor import extract_pdf_content
 from src.ingestion.text_cleaner import extract_content
+from src.ingestion.video_extractor import extract_videos
 
 
-def scrape_url(url: str, max_images: int = 3) -> dict:
-  """Coordinates downloading, text extraction, and image discovery.
+def is_pdf_url(url: str) -> bool:
+  parsed = urlparse(url)
+  return parsed.path.lower().endswith(".pdf")
 
-  """
-  print(f"[scraper] Fetching: {url}")
+
+def scrape_resource(url: str, max_images: int = 3, max_videos: int = 2) -> dict:
+  """Coordinates fetching and parsing for either PDFs or HTML pages."""
+  if is_pdf_url(url):
+    print(f"[scraper] Detected PDF URL: {url}")
+    return extract_pdf_content(url)
+
+  print(f"[scraper] Fetching HTML: {url}")
   html = fetch_html(url)
-
   if not html:
     return {
         "url": url,
@@ -19,38 +28,16 @@ def scrape_url(url: str, max_images: int = 3) -> dict:
 
   content = extract_content(html)
   images = extract_images(html, base_url=url, max_images=max_images)
+  videos = extract_videos(html, max_videos=max_videos)
 
   return {
       "url": url,
       "success": True,
       "title": content["title"],
-      "author": content["author"],
-      "date": content["date"],
+      "author": content.get("author"),
+      "date": content.get("date"),
       "text": content["text"],
       "images": images,
+      "videos": videos,
       "text_char_count": len(content["text"]),
   }
-
-
-# ==========================================
-# Direct Test Runner
-# ==========================================
-if __name__ == "__main__":
-  test_links = [
-      "https://en.wikipedia.org/wiki/Convolutional_neural_network",
-      "https://distill.pub/2016/augmented-rnns/",
-  ]
-
-  for link in test_links:
-    data = scrape_url(link, max_images=3)
-    print("\n" + "=" * 60)
-    print(f"SUCCESS: {data['success']}")
-    print(f"TITLE:   {data.get('title')}")
-    print(f"AUTHOR:  {data.get('author')}")
-    print(f"DATE:    {data.get('date')}")
-    print(f"CHARS:   {data.get('text_char_count')}")
-    print(f"IMAGES:  {data.get('images')}")
-    print("-" * 60)
-    preview = data.get("text", "")[:250].replace("\n", " ")
-    print(f"PREVIEW: {preview}...")
-    print("=" * 60)

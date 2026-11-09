@@ -10,20 +10,17 @@ class BookmarkStore:
 
   def __init__(self, db_path: str = "./data/bookmarks.db"):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-
     self.db = sqlite3.connect(db_path, check_same_thread=False)
     self.db.execute("PRAGMA journal_mode=WAL;")
     self.db.execute("PRAGMA foreign_keys=ON;")
 
-    # Enable and load sqlite-vec extension
     self.db.enable_load_extension(True)
     sqlite_vec.load(self.db)
     self.db.enable_load_extension(False)
 
     self._init_db()
-
     self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    self.splitter = TextSplitter(chunk_size=600, chunk_overlap=80)
+    self.splitter = TextSplitter(chunk_size=600, chunk_overlap=100)
 
   def _init_db(self):
     with self.db:
@@ -40,6 +37,8 @@ class BookmarkStore:
                     list_id INTEGER NOT NULL,
                     url TEXT NOT NULL,
                     title TEXT NOT NULL,
+                    images TEXT DEFAULT '[]',
+                    videos TEXT DEFAULT '[]',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(list_id) REFERENCES lists(id) ON DELETE CASCADE,
                     UNIQUE(list_id, url)
@@ -53,10 +52,7 @@ class BookmarkStore:
                 );
             """)
 
-  # --- List Management ---
-
   def get_or_create_list(self, list_name: str) -> int:
-    """Returns the ID of an existing list or creates a new one."""
     clean_name = list_name.strip()
     with self.db:
       cur = self.db.execute(
@@ -65,14 +61,12 @@ class BookmarkStore:
       row = cur.fetchone()
       if row:
         return row[0]
-
       cur = self.db.execute(
           "INSERT INTO lists (name) VALUES (?)", (clean_name,)
       )
       return cur.lastrowid
 
   def get_all_lists(self) -> list[dict]:
-    """Returns all created lists with article counts."""
     sql = """
             SELECT l.id, l.name, COUNT(a.id) as article_count
             FROM lists l
@@ -86,12 +80,15 @@ class BookmarkStore:
         for row in cursor.fetchall()
     ]
 
-  # --- Ingestion ---
-
   def add_article_to_list(
-      self, list_id: int, url: str, title: str, full_text: str
+      self,
+      list_id: int,
+      url: str,
+      title: str,
+      full_text: str,
+      images: list[str] = None,
+      videos: list[str] = None,
   ) -> int:
-    """Chunks, embeds, and stores an article attached to a specific list."""
     if not full_text or not full_text.strip():
       return 0
 
@@ -99,11 +96,11 @@ class BookmarkStore:
     if not chunks:
       return 0
 
-    # 1. Vectorize all chunks at once
     vectors = self.embedder.encode(chunks, convert_to_numpy=True).tolist()
+    images_json = json.dumps(images or [])
+    videos_json = json.dumps(videos or [])
 
     with self.db:
-      # 2. Check if this URL already exists in this list; if so, clear its old chunks
       cur = self.db.execute(
           "SELECT id FROM articles WHERE list_id = ? AND url = ?",
           (list_id, url),
@@ -116,17 +113,29 @@ class BookmarkStore:
             "DELETE FROM chunks WHERE article_id = ?", (article_id,)
         )
         self.db.execute(
-            "UPDATE articles SET title = ? WHERE id = ?",
-            (title or "Untitled", article_id),
+            """
+                    UPDATE articles 
+                    SET title = ?, images = ?, videos = ? 
+                    WHERE id = ?
+                """,
+            (title or "Untitled", images_json, videos_json, article_id),
         )
       else:
         cur = self.db.execute(
-            "INSERT INTO articles (list_id, url, title) VALUES (?, ?, ?)",
-            (list_id, url, title or "Untitled"),
+            """
+                    INSERT INTO articles (list_id, url, title, images, videos) 
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+            (
+                list_id,
+                url,
+                title or "Untitled",
+                images_json,
+                videos_json,
+            ),
         )
         article_id = cur.lastrowid
 
-      # 3. Store new chunks
       for chunk, vec in zip(chunks, vectors):
         self.db.execute(
             """
@@ -137,31 +146,10 @@ class BookmarkStore:
         )
 
     return len(chunks)
-  def get_articles_by_list(self, list_id: int) -> list[dict]:
-    """Fetches all saved URLs and titles belonging to a specific list."""
-    sql = """
-          SELECT id, url, title, created_at
-          FROM articles
-          WHERE list_id = ?
-          ORDER BY created_at DESC;
-        """
-    cursor = self.db.execute(sql, (list_id,))
-    return [
-          {
-              "id": row[0],
-              "url": row[1],
-              "title": row[2],
-              "created_at": row[3],
-          }
-          for row in cursor.fetchall()
-    ]
-
-  # --- Retrieval ---
 
   def search(
       self, query: str, list_id: int | None = None, top_k: int = 4
   ) -> list[dict]:
-    """Searches chunks across all lists, or scoped strictly to a list_id."""
     query_vec = json.dumps(self.embedder.encode(query).tolist())
 
     if list_id is not None:
@@ -169,6 +157,8 @@ class BookmarkStore:
                 SELECT 
                     a.url,
                     a.title,
+                    a.images,
+                    a.videos,
                     c.content,
                     c.distance
                 FROM chunks c
@@ -182,6 +172,8 @@ class BookmarkStore:
                 SELECT 
                     a.url,
                     a.title,
+                    a.images,
+                    a.videos,
                     c.content,
                     c.distance
                 FROM chunks c
@@ -195,8 +187,30 @@ class BookmarkStore:
         {
             "url": row[0],
             "title": row[1],
-            "content": row[2],
-            "similarity": round(1.0 - float(row[3]), 4),
+            "images": json.loads(row[2]) if row[2] else [],
+            "videos": json.loads(row[3]) if row[3] else [],
+            "content": row[4],
+            "similarity": round(1.0 - float(row[5]), 4),
+        }
+        for row in cursor.fetchall()
+    ]
+
+  def get_articles_by_list(self, list_id: int) -> list[dict]:
+    sql = """
+            SELECT id, url, title, images, videos, created_at
+            FROM articles
+            WHERE list_id = ?
+            ORDER BY created_at DESC;
+        """
+    cursor = self.db.execute(sql, (list_id,))
+    return [
+        {
+            "id": row[0],
+            "url": row[1],
+            "title": row[2],
+            "images": json.loads(row[3]) if row[3] else [],
+            "videos": json.loads(row[4]) if row[4] else [],
+            "created_at": row[5],
         }
         for row in cursor.fetchall()
     ]
